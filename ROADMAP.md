@@ -1,22 +1,26 @@
 # 7-Relay Roadmap
 
-## Phase 1: Core Router (Week 1) 🔴 CURRENT
+## Phase 1: Core Router (Week 1) ✅ DONE
 
 - [x] Project structure + Go module
 - [x] Config system (JSON-based)
 - [x] HTTP server + OpenAI-compatible endpoint
-- [x] Provider pool + basic forwarding
-- [x] OpenAI/Claude/Gemini provider adapters
-- [ ] Request/response format translation
-- [ ] Error handling + retry logic
-- [ ] Basic unit tests
+- [x] Provider pool + forwarding (OpenAI/Claude/Gemini)
+- [x] Request/response format translation (OpenAI ↔ Claude ↔ Gemini)
+- [x] Streaming SSE proxy
+- [x] Smart fallback (3-tier)
+- [x] Error handling + retry (exponential backoff)
+- [x] Circuit breaker (5 failures → 60s cooldown)
+- [x] Rate limiter (token bucket)
+- [x] Health checker (30s interval)
+- [x] Basic unit tests
 
-## Phase 2: Smart Routing (Week 1-2)
+## Phase 2: Smart Routing (Week 1-2) 🟡 CURRENT
 
-- [ ] 3-tier fallback engine
-- [ ] Provider health checks (ping endpoint)
-- [ ] Circuit breaker (auto-disable unhealthy)
-- [ ] Rate limiter (token bucket)
+- [x] 3-tier fallback engine
+- [x] Provider health checks (ping endpoint)
+- [x] Circuit breaker (auto-disable unhealthy)
+- [x] Rate limiter (token bucket)
 - [ ] Multi-account round-robin
 - [ ] Quota tracking per provider
 - [ ] Combo system (model groups)
@@ -73,8 +77,8 @@
 
 | Milestone | Date | Status |
 |---|---|---|
-| v0.1.0 - Core Router | - | 🟡 In Progress |
-| v0.2.0 - Smart Routing | - | ⚪ Not Started |
+| v0.1.0 - Core Router | 2026-09-11 | ✅ Done |
+| v0.2.0 - Smart Routing | - | 🟡 In Progress |
 | v0.3.0 - Token Savers | - | ⚪ Not Started |
 | v0.4.0 - Auth & Security | - | ⚪ Not Started |
 | v0.5.0 - TUI Dashboard | - | ⚪ Not Started |
