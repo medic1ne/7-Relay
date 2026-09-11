@@ -13,11 +13,15 @@ import (
 )
 
 type Router struct {
-	cfg       *Config
-	server    *http.Server
-	providers map[string]*ProviderPool
-	mu        sync.RWMutex
-	stats     *Stats
+	cfg        *Config
+	server     *http.Server
+	providers  map[string]*ProviderPool
+	mu         sync.RWMutex
+	stats      *Stats
+	comboMap   map[string][]string
+	translator *FormatTranslator
+	sseProxy   *SSEProxy
+	health     *HealthChecker
 }
 
 type Stats struct {
@@ -30,10 +34,11 @@ type Stats struct {
 }
 
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream,omitempty"`
-	Tools    []Tool    `json:"tools,omitempty"`
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	Stream    bool      `json:"stream,omitempty"`
+	Tools     []Tool    `json:"tools,omitempty"`
+	MaxTokens *int      `json:"max_tokens,omitempty"`
 }
 
 type Message struct {
@@ -42,7 +47,7 @@ type Message struct {
 }
 
 type Tool struct {
-	Type     string      `json:"type"`
+	Type     string       `json:"type"`
 	Function ToolFunction `json:"function"`
 }
 
@@ -62,9 +67,9 @@ type ChatResponse struct {
 }
 
 type Choice struct {
-	Index        int      `json:"index"`
-	Message      Message  `json:"message"`
-	FinishReason string   `json:"finish_reason"`
+	Index        int     `json:"index"`
+	Message      Message `json:"message"`
+	FinishReason string  `json:"finish_reason"`
 }
 
 type Usage struct {
@@ -75,8 +80,11 @@ type Usage struct {
 
 func New(cfg *Config) (*Router, error) {
 	r := &Router{
-		cfg:       cfg,
-		providers: make(map[string]*ProviderPool),
+		cfg:        cfg,
+		providers:  make(map[string]*ProviderPool),
+		comboMap:   make(map[string][]string),
+		translator: NewFormatTranslator(),
+		sseProxy:   NewSSEProxy(),
 		stats: &Stats{
 			ByProvider: make(map[string]int64),
 		},
@@ -89,15 +97,22 @@ func New(cfg *Config) (*Router, error) {
 		}
 	}
 
-	mux := http.NewServeMux()
+	// Build combo map
+	for _, combo := range cfg.Combos {
+		r.comboMap[combo.Name] = combo.Models
+	}
 
-	// OpenAI-compatible API endpoint
+	// Start health checker
+	r.health = NewHealthChecker(30 * time.Second)
+	r.health.Start(r.providers)
+
+	// HTTP routes
+	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", r.handleChatCompletions)
 	mux.HandleFunc("/v1/models", r.handleModels)
 	mux.HandleFunc("/v1/embeddings", r.handleEmbeddings)
-
-	// Health check
 	mux.HandleFunc("/health", r.handleHealth)
+	mux.HandleFunc("/v1/stats", r.handleStats)
 	mux.HandleFunc("/", r.handleRoot)
 
 	r.server = &http.Server{
@@ -115,6 +130,7 @@ func (r *Router) ListenAndServe(addr string) error {
 }
 
 func (r *Router) Shutdown() {
+	r.health.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	r.server.Shutdown(ctx)
@@ -131,10 +147,35 @@ func (r *Router) loggingMiddleware(next http.Handler) http.Handler {
 }
 
 func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
+	providerStatus := make(map[string]string)
+	r.mu.RLock()
+	for name, pool := range r.providers {
+		if pool.IsHealthy() {
+			providerStatus[name] = "healthy"
+		} else {
+			providerStatus[name] = "unhealthy"
+		}
+	}
+	r.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"version": "0.1.0",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"version":   "0.1.0",
+		"providers": providerStatus,
+	})
+}
+
+func (r *Router) handleStats(w http.ResponseWriter, req *http.Request) {
+	r.stats.mu.RLock()
+	defer r.stats.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"requests":    r.stats.Requests,
+		"tokens_used": r.stats.TokensUsed,
+		"errors":      r.stats.Errors,
+		"by_provider": r.stats.ByProvider,
 	})
 }
 
@@ -148,6 +189,7 @@ func (r *Router) handleRoot(w http.ResponseWriter, req *http.Request) {
 			"GET  /v1/models",
 			"POST /v1/embeddings",
 			"GET  /health",
+			"GET  /v1/stats",
 		},
 	})
 }
@@ -193,13 +235,17 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	// Increment request counter
+	// Track request
 	r.stats.mu.Lock()
 	r.stats.Requests++
 	r.stats.mu.Unlock()
 
-	// Find best provider for this model
+	// Resolve provider and model
 	provider, modelName := r.resolveProvider(chatReq.Model)
+	if provider == nil {
+		// Try combo fallback
+		provider, modelName = r.resolveCombo(chatReq.Model)
+	}
 	if provider == nil {
 		http.Error(w, fmt.Sprintf("No provider available for model: %s", chatReq.Model), http.StatusBadGateway)
 		return
@@ -208,21 +254,35 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 	// Rewrite model name
 	chatReq.Model = modelName
 
-	// Forward to provider
+	// Handle streaming
+	if chatReq.Stream {
+		sr := StreamRequest{
+			Request:   chatReq,
+			Provider:  provider,
+			ModelName: modelName,
+		}
+		if err := r.sseProxy.ProxyStream(req.Context(), w, sr); err != nil {
+			http.Error(w, fmt.Sprintf("Stream error: %v", err), http.StatusBadGateway)
+		}
+		return
+	}
+
+	// Non-streaming with fallback
 	resp, err := provider.Forward(req.Context(), chatReq)
 	if err != nil {
 		r.stats.mu.Lock()
 		r.stats.Errors++
 		r.stats.mu.Unlock()
 
-		// Try fallback if enabled
-		if fallback := r.findFallback(chatReq.Model); fallback != nil {
-			chatReq.Model = modelName
+		// Fallback to next tier
+		if fallback := r.findFallback(provider); fallback != nil {
+			log.Printf("[fallback] %s failed, trying %s", provider.config.Name, fallback.config.Name)
 			resp, err = fallback.Forward(req.Context(), chatReq)
 			if err != nil {
 				http.Error(w, fmt.Sprintf("All providers failed: %v", err), http.StatusBadGateway)
 				return
 			}
+			provider = fallback
 		} else {
 			http.Error(w, fmt.Sprintf("Provider error: %v", err), http.StatusBadGateway)
 			return
@@ -240,15 +300,55 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 }
 
 func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
-	// TODO: Implement embedding forwarding
-	http.Error(w, "Not implemented yet", http.StatusNotImplemented)
+	// Forward to OpenAI-compatible embedding endpoint
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer req.Body.Close()
+
+	provider, _ := r.resolveProvider("openai/text-embedding-3-small")
+	if provider == nil {
+		// Find any provider
+		r.mu.RLock()
+		for _, p := range r.providers {
+			provider = p
+			break
+		}
+		r.mu.RUnlock()
+	}
+	if provider == nil {
+		http.Error(w, "No embedding provider available", http.StatusBadGateway)
+		return
+	}
+
+	url := fmt.Sprintf("%s/embeddings", provider.config.BaseURL)
+	httpReq, err := http.NewRequest("POST", url, strings.NewReader(string(body)))
+	if err != nil {
+		http.Error(w, "Request creation failed", http.StatusInternalServerError)
+		return
+	}
+	provider.setHeaders(httpReq)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := provider.client.Do(httpReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Provider error: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func (r *Router) resolveProvider(model string) (*ProviderPool, string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Check if model has explicit provider prefix (e.g., "openai/gpt-4o")
+	// Check explicit provider prefix (e.g., "openai/gpt-4o")
 	if idx := strings.Index(model, "/"); idx > 0 {
 		providerName := model[:idx]
 		modelName := model[idx+1:]
@@ -257,7 +357,7 @@ func (r *Router) resolveProvider(model string) (*ProviderPool, string) {
 		}
 	}
 
-	// Find first provider that has this model
+	// Match by model name
 	for _, pool := range r.providers {
 		for _, m := range pool.config.Models {
 			if m == model {
@@ -269,20 +369,51 @@ func (r *Router) resolveProvider(model string) (*ProviderPool, string) {
 	return nil, ""
 }
 
-func (r *Router) findFallback(model string) *ProviderPool {
+func (r *Router) resolveCombo(model string) (*ProviderPool, string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Sort by tier, try tier 2 then tier 3
-	var candidates []*ProviderPool
-	for _, pool := range r.providers {
-		if pool.config.Tier >= 2 {
-			candidates = append(candidates, pool)
+	// Check if model matches a combo name
+	comboModels, ok := r.comboMap[model]
+	if !ok {
+		return nil, ""
+	}
+
+	// Try each model in combo order
+	for _, cm := range comboModels {
+		for _, pool := range r.providers {
+			if pool.IsHealthy() {
+				for _, m := range pool.config.Models {
+					if m == cm {
+						return pool, m
+					}
+				}
+			}
 		}
 	}
 
-	if len(candidates) > 0 {
-		return candidates[0]
+	return nil, ""
+}
+
+func (r *Router) findFallback(current *ProviderPool) *ProviderPool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Find provider with higher tier number (cheaper/free)
+	for _, pool := range r.providers {
+		if pool.config.Name != current.config.Name && pool.IsHealthy() {
+			if pool.config.Tier > current.config.Tier {
+				return pool
+			}
+		}
 	}
+
+	// If current is already highest tier, try any healthy provider
+	for _, pool := range r.providers {
+		if pool.config.Name != current.config.Name && pool.IsHealthy() {
+			return pool
+		}
+	}
+
 	return nil
 }

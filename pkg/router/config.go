@@ -58,7 +58,7 @@ func DefaultConfig() *Config {
 	os.MkdirAll(configDir, 0700)
 
 	return &Config{
-		Port: 20128,
+		Port: 20130,
 		Providers: []ProviderConfig{
 			{
 				Name:    "openai",
